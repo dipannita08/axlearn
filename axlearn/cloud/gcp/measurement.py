@@ -4,7 +4,7 @@
 
    Example:
 
-   # Enable GoodPut when launching an AXLearn training job
+   # Enable Goodput when launching an AXLearn training job
    axlearn gcp gke start --instance_type=tpu-v5litepod-16 \
         --bundler_type=artifactregistry --bundler_spec=image=tpu \
         --bundler_spec=dockerfile=Dockerfile \
@@ -12,9 +12,12 @@
         --recorder_type=axlearn.cloud.gcp.measurement:goodput \
         --recorder_spec=name=my-run-with-goodput \
         --recorder_spec=upload_dir=my-output-directory/summaries \
-        --recorder_spec=upload_interval=30
+        --recorder_spec=upload_interval=30 \
+        --recorder_spec=enable_gcp_goodput_metrics=True
 
 """
+
+from typing import Optional
 
 import jax
 from absl import flags, logging
@@ -37,10 +40,13 @@ class GoodputRecorder(measurement.Recorder):
         Attributes:
             upload_dir: Directory to store metrics for the monitor.
             upload_interval: Time interval (seconds) for monitoring uploads.
+            enable_gcp_goodput_metrics: Whether to push Goodput metrics to
+              Google Cloud Monitoring.
         """
 
         upload_dir: Required[str] = REQUIRED
         upload_interval: Required[int] = REQUIRED
+        enable_gcp_goodput_metrics: bool = True  # Default to True
 
     @classmethod
     def from_flags(cls, fv: flags.FlagValues) -> "GoodputRecorder":
@@ -52,6 +58,8 @@ class GoodputRecorder(measurement.Recorder):
          - upload_dir: The directory to write Tensorboard data to.
          - upload_interval: The time interval in seconds at which to query and upload data
            to Tensorboard.
+        - enable_gcp_goodput_metrics: Whether to push Goodput metrics to Google Cloud
+            Monitoring.
         """
         cfg: measurement.Recorder.Config = cls.default_config()
         cfg = maybe_set_config(cfg, **parse_kv_flags(fv.recorder_spec, delimiter="="))
@@ -109,9 +117,16 @@ class GoodputRecorder(measurement.Recorder):
         If there are internal GCP errors from querying and uploading data, these will be
         logged without affecting the workload. GoodputMonitor logs will provide further
         information if data is not being uploaded correctly.
+
+        Default behavior is to push metrics to Google Cloud Monitoring. 
+        This behavior can be overridden by setting the flags:
+            --recorder_spec=enable_gcp_goodput_metrics=False
         """
         if self._monitor is None:
             cfg: GoodputRecorder.Config = self.config
+            gcp_options = goodput_monitoring.GCPOptions(
+                enable_gcp_goodput_metrics=cfg.enable_gcp_goodput_metrics,
+            )
             self._monitor = goodput_monitoring.GoodputMonitor(
                 job_name=cfg.name,
                 logger_name=f"goodput_logger_{cfg.name}",
@@ -119,6 +134,7 @@ class GoodputRecorder(measurement.Recorder):
                 upload_interval=int(cfg.upload_interval),
                 monitoring_enabled=(jax.process_index() == 0),
                 include_badput_breakdown=True,
+                gcp_options=gcp_options,
             )
 
         if jax.process_index() == 0:
