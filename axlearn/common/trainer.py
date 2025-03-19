@@ -1070,17 +1070,17 @@ class SpmdTrainer(Module):
 
         self.summary_writer(self.step, {"loss": outputs["loss"], **outputs["summaries"]})
         # Aggregate summaries across evalers.
-        evaler_summaries = self._run_eval(
-            train_summaries=outputs["summaries"], force_runs=force_run_evals
-        )
+        #evaler_summaries = self._run_eval(
+        #    train_summaries=outputs["summaries"], force_runs=force_run_evals
+        #)
 
         # Checkpointer policy will decide if we should save.
-        self.save_checkpoint(evaler_summaries=evaler_summaries)
+        #self.save_checkpoint(evaler_summaries=evaler_summaries)
 
         return_dict = {"loss": outputs["loss"], "aux": outputs["aux"]}
         # Returns evaler_summaries if force_run_evals is not None or empty set.
-        if force_run_evals:
-            return_dict["evaler_summaries"] = evaler_summaries
+        #if force_run_evals:
+        #    return_dict["evaler_summaries"] = evaler_summaries
 
         return return_dict
 
