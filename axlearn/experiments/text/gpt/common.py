@@ -32,6 +32,7 @@ from axlearn.common import (
 )
 from axlearn.common.attention import (
     AttentionLogitBiasLayer,
+    BaseKVCache,
     BaseQKVLinear,
     MultiheadAttention,
     RepeatedTransformerLayer,
@@ -54,6 +55,7 @@ from axlearn.common.embedding import TransformerTextEmbeddings
 from axlearn.common.evaler import BaseMetricCalculator, ModelSummaryAccumulator, SpmdEvaler
 from axlearn.common.evaler import every_n_steps_policy as eval_every_n_steps_policy
 from axlearn.common.flash_attention.layer import FlashAttention
+from axlearn.common.input_dispatch import InputDispatcher
 from axlearn.common.layers import BaseNormalizationLayer, set_bias_recursively, set_norm_recursively
 from axlearn.common.optimizer_base import PartitionedGradientTransformation
 from axlearn.common.param_init import PARAM_REGEXP_WEIGHT, DefaultInitializer, WeightInitializer
@@ -219,6 +221,7 @@ def model_config(
     layer_cfg: TransformerLayer.Config = TransformerLayer.default_config(),
     attention_cfg: Optional[MultiheadAttention.Config] = None,
     attention_qkv_linear: Optional[BaseQKVLinear.Config] = None,
+    attention_kv_cache: Optional[BaseKVCache.Config] = None,
     attention_mask: Optional[AttentionLogitBiasLayer.Config] = None,
     z_loss_scale: float = 0.0,
     ffn_structure: str = "prenorm",
@@ -246,6 +249,7 @@ def model_config(
         layer_cfg: The transformer layer config.
         attention_cfg: The attention config.
         attention_qkv_linear: The attention QKV linear layer.
+        attention_kv_cache: The attention KV Cache layer.
         attention_mask: The AttentionLogitBiasLayer config.
         z_loss_scale: The scalar weight for the z-loss to encourages the cross-entropy loss
             normalizer to be well-behaved.
@@ -273,6 +277,8 @@ def model_config(
     layer_cfg.self_attention.attention.num_heads = num_heads
     if attention_qkv_linear is not None:
         layer_cfg.self_attention.attention.input_linear = attention_qkv_linear
+    if attention_kv_cache is not None:
+        layer_cfg.self_attention.attention.kv_cache = attention_kv_cache
     layer_cfg.self_attention.structure = atten_structure
     layer_cfg.self_attention.attention.atten_logit_cap = atten_logit_cap
     if issubclass(stack_cfg.klass, (RepeatedTransformerLayer, StackedTransformerLayer)):
@@ -573,8 +579,9 @@ def evaler_config_dict(
         evaler_input = input_tf_data.Input.default_config().set(
             is_training=False,
             source=input_source_config,
+            input_dispatcher=InputDispatcher.default_config(),
             processor=config_for_function(input_tf_data.identity),
-            batcher=config_for_function(input_tf_data.batch).set(
+            batcher=config_for_function(input_tf_data.per_feed_batch).set(
                 prefetch_buffer_size=tf.data.AUTOTUNE,
                 pad_example_fn=input_tf_data.default_pad_example_fn,
             ),
@@ -673,9 +680,11 @@ def get_trainer_config_fn(
         cfg.input = input_tf_data.Input.default_config().set(
             is_training=True,
             source=train_input_source,
+            input_dispatcher=InputDispatcher.default_config().set(
+                global_logical_batch_size=train_batch_size,
+            ),
             processor=config_for_function(input_tf_data.identity),
-            batcher=config_for_function(input_tf_data.batch).set(
-                global_batch_size=train_batch_size,
+            batcher=config_for_function(input_tf_data.per_feed_batch).set(
                 prefetch_buffer_size=tf.data.AUTOTUNE,
                 pad_example_fn=input_tf_data.default_pad_example_fn,
             ),
@@ -690,7 +699,9 @@ def get_trainer_config_fn(
         )
         cfg.evalers = {}
         for name, evaler_cfg in evalers.items():
-            evaler_cfg.input.batcher.set(global_batch_size=eval_batch_size or train_batch_size)
+            evaler_cfg.input.input_dispatcher.global_logical_batch_size = (
+                eval_batch_size or train_batch_size
+            )
             evaler_cfg.set(
                 eval_policy=config_for_function(eval_every_n_steps_policy).set(
                     n=eval_every_n_steps,

@@ -19,6 +19,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from axlearn.common.attention_bias import (
     CausalAttentionBias,
     MaskFnAttentionBias,
+    SlidingWindowAttentionBias,
     ZeroAttentionBias,
     causal_mask,
     sliding_window_causal_mask,
@@ -43,7 +44,7 @@ def jax_fn_mask(query_position: Tensor, key_position: Tensor) -> Tensor:
     SplashAttention since `tpu_flash_attention()` needs to wrap this function
     to return numpy values if the input is numpy. (Otherwise we get tracer errors in jit.)
     """
-    return jnp.greater_equal(query_position, key_position)
+    return query_position >= key_position
 
 
 class TestFlashAttention(TestCase):
@@ -79,9 +80,19 @@ class TestFlashAttention(TestCase):
 
     @parameterized.parameters(
         [ZeroAttentionBias(), splash_attention_mask.FullMask((8, 8))],
-        [CausalAttentionBias(shape=(8, 8)), splash_attention_mask.CausalMask(shape=(8, 8))],
         [
-            MaskFnAttentionBias(sliding_window_causal_mask(4), shape=(8, 8)),
+            CausalAttentionBias(
+                target_positions=jnp.arange(8)[None], source_positions=jnp.arange(8)[None]
+            ),
+            splash_attention_mask.CausalMask(shape=(8, 8)),
+        ],
+        [
+            SlidingWindowAttentionBias(
+                sliding_window_causal_mask(4),
+                sliding_window_size=4,
+                target_positions=jnp.arange(8)[None],
+                source_positions=jnp.arange(8)[None],
+            ),
             splash_attention_mask.LocalMask(shape=(8, 8), window_size=(4, 0), offset=0),
         ],
     )
@@ -93,7 +104,7 @@ class TestFlashAttention(TestCase):
     @parameterized.product(
         batch_size=[4],
         seq_len=[1024, 32768],
-        mask_fn=["zero", "causal", "sliding"],
+        mask_fn=["zero", "causal", "sliding", "custom"],
         sliding_window_size=[1024],
         num_heads=[4],
         per_head_dim=[256],
@@ -143,10 +154,22 @@ class TestFlashAttention(TestCase):
                 if mask_fn == "zero":
                     mask = ZeroAttentionBias()
                 elif mask_fn == "causal":
-                    mask = CausalAttentionBias(shape=(seq_len, seq_len))
-                elif mask_fn.startswith("sliding"):
+                    mask = CausalAttentionBias(
+                        target_positions=jnp.arange(seq_len)[None],
+                        source_positions=jnp.arange(seq_len)[None],
+                    )
+                elif mask_fn == "sliding":
+                    mask = SlidingWindowAttentionBias(
+                        sliding_window_causal_mask(sliding_window_size),
+                        sliding_window_size=sliding_window_size,
+                        target_positions=jnp.arange(seq_len)[None],
+                        source_positions=jnp.arange(seq_len)[None],
+                    )
+                elif mask_fn == "custom":
                     mask = MaskFnAttentionBias(
-                        sliding_window_causal_mask(sliding_window_size), shape=(seq_len, seq_len)
+                        jax_fn_mask,
+                        target_positions=jnp.arange(seq_len)[None],
+                        source_positions=jnp.arange(seq_len)[None],
                     )
 
                 attn = lambda q, k, v: tpu_attention.tpu_flash_attention(
@@ -247,10 +270,20 @@ class TestFlashAttention(TestCase):
 
         legacy_flash_wrapper = unittest.mock.Mock(wraps=tpu_attention._legacy_tpu_flash_attention)
 
-        if mask is not None:
-            mask = MaskFnAttentionBias(mask, shape=(query_len, kv_len))
-        else:
+        if mask is None:
             mask = ZeroAttentionBias()
+        elif mask is causal_mask:
+            mask = CausalAttentionBias(
+                mask,
+                target_positions=jnp.arange(query_len)[None],
+                source_positions=jnp.arange(kv_len)[None],
+            )
+        else:
+            mask = MaskFnAttentionBias(
+                mask,
+                target_positions=jnp.arange(query_len)[None],
+                source_positions=jnp.arange(kv_len)[None],
+            )
 
         def fn(q, k, v, bias, ids):
             record_legacy_call = unittest.mock.patch.object(

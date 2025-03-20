@@ -48,9 +48,11 @@ from axlearn.cloud.common.utils import (
 from axlearn.cloud.gcp.bundler import ArtifactRegistryBundler
 from axlearn.cloud.gcp.config import gcp_settings
 from axlearn.cloud.gcp.event_queue import event_queue_from_config
-from axlearn.cloud.gcp.job import BASTION_JOB_VERSION_LABEL, GCPJob, GKEJob, GPUGKEJob, TPUGKEJob
+from axlearn.cloud.gcp.job import GCPJob, GKEJob, GPUGKEJob, TPUGKEJob
+from axlearn.cloud.gcp.job_flink import FlinkTPUGKEJob
 from axlearn.cloud.gcp.jobs import runner_utils
 from axlearn.cloud.gcp.jobs.tpu_runner import with_tpu_training_defaults
+from axlearn.cloud.gcp.jobset_utils import BASTION_JOB_VERSION_LABEL
 from axlearn.cloud.gcp.node_pool import (
     PRE_PROVISIONER_LABEL,
     delete_node_pools,
@@ -204,6 +206,9 @@ class GKERunnerJob(GCPJob):
         super().__init__(cfg)
         cfg = self.config
         # Instantiate inner job impl.
+        # TODO(markblee): Reduce the number of pass-through args. Some of these fields can be
+        # directly initialized within `inner` and read from `cfg.inner`. This minimizes config
+        # duplication/ambiguity about where values are read from.
         self._inner: GKEJob = cfg.inner.set(
             name=cfg.name,
             bundler=cfg.bundler,
@@ -527,6 +532,80 @@ class TPUGKERunnerJob(GKERunnerJob):
         return cfg
 
 
+class FlinkGKERunnerJob(GKERunnerJob):
+    """A GKERunnerJob that uses FlinkGKEJob."""
+
+    inner = FlinkTPUGKEJob
+    pre_provisioner = TPUNodePoolProvisioner
+
+    def _get_status(self) -> GKERunnerJob.Status:
+        """Retrieves the current status of the job.
+
+        Returns:
+            GKERunnerJob.Status:
+                SUCCEEDED: When the job succeeded.
+                PENDING: When the job hasn't started yet.
+                READY: When the job is running.
+                UNKNOWN: All other cases.
+
+        Raises:
+            RuntimeError: When the job fails, and GKE runner will retry it.
+        """
+        cfg: GKERunnerJob.Config = self.config
+        try:
+            resp = k8s.client.CustomObjectsApi().get_namespaced_custom_object_status(
+                name=cfg.name,
+                namespace=cfg.inner.namespace,
+                group="batch",
+                version="v1",
+                plural="jobs",
+            )
+
+            status = resp.get("status", {})
+            conditions = status.get("conditions", [])
+            condition = conditions[-1] if conditions else {}
+
+            # If a job complete or failed, it is shown in the last condition of its status.
+            if condition.get("type") == "Complete" and condition.get("status") == "True":
+                return GKERunnerJob.Status.SUCCEEDED
+            elif condition.get("type") == "Failed" and condition.get("status") == "True":
+                raise RuntimeError(
+                    "Beam execution failed, it's up to the GKE runner "
+                    "to decide whether to retry."
+                )
+
+            # Otherwise, we rely on the active/succeeded/failed to derive its status.
+            # Note that we currently set restartPolicy="Never" for this job and rely on GKERunner
+            # to retry the whole job submitter and flink cluster bundle as a whole. So when the
+            # code passed the finish condition check and comes to here, there are only two more
+            # valid cases remaining:
+            # active == 0 and succeeded == 0 and failed == 0 means PENDING
+            # active == 1 means READY
+            active = status.get("active", 0)
+            succeeded = status.get("succeeded", 0)
+            failed = status.get("failed", 0)
+
+            # The job has not started running yet.
+            if active == 0 and succeeded == 0 and failed == 0:
+                return GKERunnerJob.Status.PENDING
+
+            # Check if the job is still active.
+            if active > 0:
+                return GKERunnerJob.Status.READY
+
+            # If we can't determine the status, return UNKNOWN
+            return GKERunnerJob.Status.UNKNOWN
+
+        except k8s.client.exceptions.ApiException as e:
+            if e.status == 404:
+                return GKERunnerJob.Status.NOT_STARTED
+            raise
+        except KeyError as e:
+            # Can happen if job was just submitted.
+            logging.warning("Got KeyError: %s, attempting to ignore.", e)
+        return GKERunnerJob.Status.UNKNOWN
+
+
 class GPUGKERunnerJob(GKERunnerJob):
     """A GKERunnerJob that uses GPUGKEJob."""
 
@@ -537,6 +616,8 @@ def _get_runner_or_exit(instance_type: str):
     if instance_type.startswith("tpu"):
         return TPUGKERunnerJob
     elif instance_type.startswith("gpu-a3"):
+        # TODO(markblee): We can directly construct:
+        # GKERunnerJob.with_inner(GKEJob.with_jobset(A3ReplicatedJob))
         return GPUGKERunnerJob
     else:
         raise app.UsageError(f"Unknown instance_type {instance_type}")

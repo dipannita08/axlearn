@@ -168,7 +168,7 @@ def _match_tool_call_with_rules(
     seen_arguments = []
     if "arguments" in match_rule:
         for arg_name, rule in match_rule["arguments"].items():
-            if not arg_name in pred_args:
+            if arg_name not in pred_args:
                 return False
             if not _match_argument(
                 arg_name=arg_name,
@@ -180,7 +180,7 @@ def _match_tool_call_with_rules(
             seen_arguments.append(arg_name)
 
     for arg in set(list(pred_args.keys()) + list(target_args.keys())):
-        if not arg in seen_arguments:
+        if arg not in seen_arguments:
             pred_value = pred_args.get(arg, None)
             target_value = target_args.get(arg, None)
             if not _default_value_match(pred_value, target_value):
@@ -513,16 +513,16 @@ def metric_fn(
 
         target = OpenAIClient.format_message(target_message)
 
-        if target.tool_calls is not None:
+        if target.tool_calls:
             target_tool_calls = get_tool_calls_from_message(target.model_dump())
             total_tool_calls += len(target_tool_calls)
             number_of_func_call_intents_ground_truth += 1
 
         if len(pred_messages) > 0:
             pred = pred_messages[0]
-            if pred.tool_calls is not None:
+            if pred.tool_calls:
                 number_of_func_call_intents_pred += 1
-                if target.tool_calls is not None:
+                if target.tool_calls:
                     number_of_func_call_intents_ground_truth_pred += 1
 
             # Check string match.
@@ -533,8 +533,8 @@ def metric_fn(
             ):
                 matched = True
             elif (
-                target.tool_calls is not None
-                and pred.tool_calls is not None
+                target.tool_calls
+                and pred.tool_calls
                 and len(target.tool_calls) == len(pred.tool_calls)
             ):
                 pred_tool_calls = get_tool_calls_from_message(pred.model_dump())
@@ -545,7 +545,7 @@ def metric_fn(
                     match_rules=match_rules,
                 )
 
-            if target.tool_calls is not None and pred.tool_calls is not None:
+            if target.tool_calls and pred.tool_calls:
                 # Run the detailed too call matching.
                 pred_tool_calls = get_tool_calls_from_message(pred.model_dump())
                 detailed_results = _compare_tool_call_detailed(
